@@ -1,7 +1,18 @@
 --[[
 ================================================================================
-  USSI OBJECT PICKER  v3.0  —  выбор объектов внутри сервисов + телефон/ПК
+  USSI OBJECT PICKER  v3.1  —  выбор объектов внутри сервисов + телефон/ПК
 ================================================================================
+
+  ЧТО ИСПРАВЛЕНО В v3.1
+  ---------------------
+   * ГЛАВНОЕ: исправлен пустой выбранный объект. В v3.0 путь до выбранного
+     объекта обрезался и у САМОГО объекта тоже — USSI честно вырезал его
+     содержимое, и в Studio объект появлялся пустым. Теперь у выбранного
+     объекта сохраняется всё внутри (кроме того, что отмечено как исключение).
+   * Имя файла теперь содержит название плейса и его ID:
+     USSI_<НазваниеПлейса>_<PlaceId>_<объект>.rbxl
+   * Существующие файлы не перезаписываются: добавляется (1), (2), ...
+   * В логе видно, сколько объектов внутри выбранного и нет ли пустых веток.
 
   ЧТО ИСПРАВЛЕНО В v3 (по сравнению с v2)
   ---------------------------------------
@@ -296,6 +307,74 @@ local function writeOut(path, payload)
 		end
 	end
 	return true, size
+end
+
+-- название плейса (кэшируется), по возможности через MarketplaceService
+local PlaceInfo = { name = nil }
+
+local function placeName()
+	if PlaceInfo.name then
+		return PlaceInfo.name
+	end
+	local ms = game:GetService("MarketplaceService")
+	local tries = {
+		function()
+			return ms:GetProductInfoAsync(game.PlaceId, Enum.InfoType.Game)
+		end,
+		function()
+			return ms:GetProductInfo(game.PlaceId, Enum.InfoType.Game)
+		end,
+		function()
+			return ms:GetProductInfoAsync(game.PlaceId)
+		end,
+		function()
+			return ms:GetProductInfo(game.PlaceId)
+		end,
+	}
+	for _, fn in ipairs(tries) do
+		local ok, info = pcall(fn)
+		if ok and type(info) == "table" and type(info.Name) == "string" and info.Name ~= "" then
+			PlaceInfo.name = info.Name
+			return PlaceInfo.name
+		end
+	end
+	return nil
+end
+
+-- имя файла: USSI_<НазваниеПлейса>_<ID>_<база>.<ext>
+local function buildFileName(base, ext)
+	local name = placeName()
+	local parts = { "USSI" }
+	if name then
+		parts[#parts + 1] = sanitizeName(name)
+	end
+	parts[#parts + 1] = tostring(game.PlaceId)
+	if base and base ~= "" then
+		parts[#parts + 1] = base
+	end
+	local full = table.concat(parts, "_")
+	if #full > 110 then
+		full = string.sub(full, 1, 110)
+	end
+	return full .. ext
+end
+
+-- не перезаписываем существующие файлы
+local function freePath(path)
+	if fileExists(path) ~= true then
+		return path
+	end
+	local stem, ext = string.match(path, "^(.*)(%.[%w]+)$")
+	if not stem then
+		return path
+	end
+	for i = 1, 200 do
+		local candidate = stem .. "(" .. i .. ")" .. ext
+		if fileExists(candidate) ~= true then
+			return candidate
+		end
+	end
+	return path
 end
 
 local function workspaceFolder()
@@ -1981,18 +2060,41 @@ local function buildPlan(picks)
 		end
 	end
 
+	local pickSet = {}
+	for _, node in ipairs(picks) do
+		pickSet[node.inst] = true
+	end
+
 	local ignore, ignoreCount = {}, 0
+	local function addIgnore(inst)
+		if inst and not ignore[inst] then
+			ignore[inst] = true
+			ignoreCount = ignoreCount + 1
+		end
+	end
+
+	-- 1) На пути к выбору отрезаем всё, что не ведёт к выбранному объекту.
+	--    ВАЖНО: сами выбранные объекты (pickSet) не трогаем — иначе USSI
+	--    вырежет их содержимое и объект сохранится пустым.
 	for _, n in ipairs(keepList) do
-		local ok, kids = pcall(function()
-			return n.inst:GetChildren()
-		end)
-		if ok then
-			for _, child in ipairs(kids) do
-				if not keepSet[child] then
-					ignore[child] = true
-					ignoreCount = ignoreCount + 1
+		if not pickSet[n.inst] then
+			local ok, kids = pcall(function()
+				return n.inst:GetChildren()
+			end)
+			if ok then
+				for _, child in ipairs(kids) do
+					if not keepSet[child] then
+						addIgnore(child)
+					end
 				end
 			end
+		end
+	end
+
+	-- 2) Явные исключения: снятые галочки внутри выбранного объекта.
+	for _, node in ipairs(exclusions()) do
+		if not keepSet[node.inst] then
+			addIgnore(node.inst)
 		end
 	end
 
@@ -2028,16 +2130,20 @@ local function runUSSI(roots, ignore, ov)
 	if #roots == 1 then
 		base = sanitizeName(roots[1].Name)
 	else
-		base = "USSI_Selected_" .. #roots .. "_items"
+		base = "selected_" .. #roots .. "_items"
 	end
+
+	local fileName = buildFileName(base, ext)
+	logLine(string.format("плейс: %s (ID %d)", tostring(placeName() or "неизвестен"), game.PlaceId))
+	logLine("имя файла: " .. fileName)
 
 	local attempts = {}
 	if CONFIG.OutFolder then
-		attempts[#attempts + 1] = CONFIG.OutFolder .. "/" .. base .. ext
+		attempts[#attempts + 1] = freePath(CONFIG.OutFolder .. "/" .. fileName)
 	else
-		attempts[#attempts + 1] = base .. ext
+		attempts[#attempts + 1] = freePath(fileName)
 	end
-	attempts[#attempts + 1] = "USSI_" .. base .. ext
+	attempts[#attempts + 1] = freePath("USSI_" .. fileName)
 
 	local result = { ok = false, path = nil, size = nil, err = nil }
 	local genv = getGenv()
@@ -2270,11 +2376,25 @@ function UI.runExport(roots, ignore, ignoreCount)
 	if not okOverlay then
 		notify("Object Picker", "Экспорт пошёл, но окно прогресса не создалось: " .. tostring(overlayErr), 8)
 	end
+	-- сколько объектов внутри каждой выбранной ветки (для контроля пустоты)
+	local insideCount, emptyPicks = 0, {}
+	for _, node in ipairs(topPicks()) do
+		local n = countInstances(node.inst, 100000)
+		insideCount = insideCount + n + 1
+		if n == 0 then
+			emptyPicks[#emptyPicks + 1] = node.name
+		end
+	end
+
 	if ov then
 		ov.setProgress(0.05)
 		ov.setJob("подготовка…")
 		say("Формат: " .. (S.binary and (S.format == "rbxl" and ".rbxl (бинарный)" or ".rbxm (бинарный)") or (S.format == "rbxl" and ".rbxlx (XML)" or ".rbxmx (XML)")), P.text)
-		say(string.format("Корней: %d, отрезанных веток: %d", #roots, ignoreCount or 0))
+		say(string.format("Плейс: %s (ID %d)", tostring(placeName() or "название недоступно"), game.PlaceId), P.text)
+		say(string.format("Корней: %d, объектов внутри выбранного: %d, отрезанных веток: %d", #roots, insideCount, ignoreCount or 0))
+		if #emptyPicks > 0 then
+			say("⚠ внутри пусто у: " .. table.concat(emptyPicks, ", ") .. " — возможно, не репликуется клиенту", P.warn)
+		end
 		if hideGui then
 			say("Окно выбора скрыто на время дампа.", P.warn)
 		end
