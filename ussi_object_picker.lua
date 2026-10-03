@@ -1,7 +1,30 @@
 --[[
 ================================================================================
-  USSI OBJECT PICKER  v3.4  —  починен рендер превью + тест 3D
+  USSI OBJECT PICKER  v3.5  —  превью игрового UI: сдвиг, масштаб, слои
 ================================================================================
+
+  ИСПРАВЛЕНО В v3.5
+  ------------------
+   * НЕ ПОКАЗЫВАЛОСЬ ИГРОВОЕ UI. Причина: стоял лимит «не больше 250 элементов
+     интерфейса» — у реальной игры элементов больше, превью отказывалось
+     строиться, а текст отказа было видно только на высокой панели. Теперь
+     лимит 4000, а про отказ всегда пишет статус-строка.
+   * UI теперь можно ДВИГАТЬ И МАСШТАБИРОВАТЬ: один палец — сдвиг,
+     два пальца — пинч-зум, колесо мыши на ПК, кнопки «−» и «+», «↻» —
+     вернуть в исходный вид.
+   * PlayerGui и StarterGui показываются слоями: все ScreenGui сразу, как в игре
+     (до 8 слоёв). Выключенные в игре слои (Enabled = false) принудительно
+     включаются для просмотра.
+   * Выбрал игрока в Players — покажем его персонажа.
+   * Панель подсказывает, что делать: 3D — «крути пальцем — поворот, ± масштаб»,
+     UI — «тяни пальцем — двигать, два пальца — масштаб».
+   * Лимит 3D-объектов поднят с 900 до 2500 частей.
+   * ЭКСПОРТ: жёлтая строка «⚠ внутри пусто у: …» выглядела как ошибка.
+     Теперь это спокойное пояснение «ℹ у N объектов нет содержимого —
+     сохранятся пустыми, это нормально», полный список пишется в лог.
+   * Полоса прогресса при экспорте больше не стоит на месте — она идёт, пока
+     USSI пишет файл, и в конце появляется итог «✅ ГОТОВО» или «❌ НЕ
+     СОХРАНИЛОСЬ: причина».
 
   ИСПРАВЛЕНО В v3.4
   ------------------
@@ -151,8 +174,10 @@ local CONFIG = {
 
 	-- превью
 	PreviewEnabled = true,   -- показывать панель предпросмотра
-	PreviewMaxParts = 900,   -- больше этого числа частей превью не строится
-	PreviewMaxGui = 250,     -- максимум элементов в превью игрового UI
+	PreviewMaxParts = 2500,  -- больше этого числа частей превью не строится
+	PreviewMaxGui = 4000,    -- максимум элементов в превью игрового UI
+	PreviewGuiSoft = 900,    -- выше этого числа элементов — предупреждаем о тормозах
+	PreviewMaxLayers = 8,    -- сколько слоёв (ScreenGui) показывать из PlayerGui
 	PreviewAutoRotate = true,
 	PreviewSourceLines = 14, -- сколько строк кода показывать у скриптов
 
@@ -1428,6 +1453,7 @@ function Preview.clear()
 		end)
 	end
 	Preview.world, Preview.camera, Preview.center, Preview.size, Preview.guiClone = nil, nil, nil, nil, nil
+	Preview.guiWrap, Preview.guiScale, Preview.guiPan, Preview.guiZoom, Preview.guiPanFrame = nil, nil, nil, nil, nil
 	if UI.previewGuiHolder then
 		UI.previewGuiHolder.Visible = false
 		for _, child in ipairs(UI.previewGuiHolder:GetChildren()) do
@@ -1487,6 +1513,7 @@ function Preview.buildIdle()
 	viewport.Visible = true
 
 	Preview.world, Preview.camera = holder, cam
+	Preview.mode = "3d"
 	Preview.center, Preview.size = Vector3.new(0, 0, 0), Vector3.new(7, 2, 2)
 
 	Preview.initLoop()
@@ -1495,6 +1522,54 @@ function Preview.buildIdle()
 		viewport.CurrentCamera = cam
 	end)
 	Preview.status("тест 3D: кубики видны? тапни объект в списке", P.ok)
+end
+
+-- режим: "3d" — объекты, "gui" — игровой интерфейс
+function Preview.applyGui()
+	local panFrame, scale = Preview.guiPanFrame, Preview.guiScale
+	if not panFrame or not scale then
+		return
+	end
+	local pan = Preview.guiPan or Vector2.new(0, 0)
+	pcall(function()
+		panFrame.Position = UDim2.new(0, pan.X, 0, pan.Y)
+	end)
+	pcall(function()
+		scale.Scale = Preview.guiZoom or 1
+	end)
+end
+
+function Preview.zoomBy(factor)
+	factor = factor or 1
+	if Preview.mode == "gui" then
+		Preview.guiZoom = math.clamp((Preview.guiZoom or 1) * factor, 0.02, 6)
+		Preview.applyGui()
+		if UI.previewStatus and Preview.guiElements then
+			Preview.status(string.format("UI · %d элем. · масштаб %d%% · тяни — двигать, 2 пальца — масштаб", Preview.guiElements, math.floor(Preview.guiZoom * 100)), P.muted)
+		end
+	else
+		Preview.zoom = math.clamp((Preview.zoom or 1) * factor, 0.25, 5)
+		Preview.applyCamera()
+	end
+end
+
+function Preview.panBy(delta)
+	if Preview.mode ~= "gui" or not delta then
+		return
+	end
+	Preview.guiPan = (Preview.guiPan or Vector2.new(0, 0)) + delta
+	Preview.applyGui()
+end
+
+function Preview.resetView()
+	if Preview.mode == "gui" then
+		Preview.guiPan = Vector2.new(0, 0)
+		Preview.guiZoom = Preview.guiFit or 1
+		Preview.applyGui()
+	else
+		Preview.yaw, Preview.pitch, Preview.zoom = 0.7, 0.35, 1
+		Preview.applyCamera()
+	end
 end
 
 function Preview.applyCamera()
@@ -1521,7 +1596,7 @@ function Preview.initLoop()
 	local signal = RunService.RenderStepped or RunService.Heartbeat
 	local ok, conn = pcall(function()
 		return signal:Connect(function(dt)
-			if not Preview.visible or not Preview.camera or not Preview.center then
+			if not Preview.visible or Preview.mode == "gui" or not Preview.camera or not Preview.center then
 				return
 			end
 			if Preview.autoRotate then
@@ -1588,6 +1663,7 @@ function Preview.build3D(inst)
 	viewport.Visible = true
 
 	Preview.world, Preview.camera = holder, cam
+	Preview.mode = "3d"
 	Preview.center, Preview.size = center, size
 
 	if UI.previewGuiHolder then
@@ -1606,6 +1682,9 @@ function Preview.build3D(inst)
 			parts = parts + 1
 		end
 	end
+	if UI.previewHint then
+		UI.previewHint.Text = "крути пальцем — поворот, ± масштаб"
+	end
 	Preview.status(string.format("3D · %s · частей %d · %.1f×%.1f×%.1f", inst.ClassName, parts, size.X, size.Y, size.Z), P.muted)
 	return true
 end
@@ -1617,160 +1696,180 @@ function Preview.buildGui(inst)
 		return nil, "окно превью не создано"
 	end
 
-	local count = countInstances(inst, CONFIG.PreviewMaxGui)
+	local count = countInstances(inst, CONFIG.PreviewMaxGui + 1)
 	if count and count > CONFIG.PreviewMaxGui then
 		return nil, "слишком много элементов UI для превью: " .. count
 	end
 
-	local ok, clone = pcall(function()
-		return inst:Clone()
-	end)
-	if not ok or not clone then
-		return nil, "не удалось скопировать UI"
+	-- размер, под который была нарисована эта UI
+	local function designSizeOf(obj)
+		local ok, size = pcall(function()
+			return obj.AbsoluteSize
+		end)
+		if ok and size and size.X > 1 and size.Y > 1 then
+			return size
+		end
+		local vp = viewportSize()
+		return Vector2.new(math.max(vp.X, 800), math.max(vp.Y, 450))
+	end
+	local design = designSizeOf(inst)
+
+	-- какие слои показываем: сам объект либо все ScreenGui внутри PlayerGui/StarterGui
+	local layers, layerNames, skipped = {}, {}, 0
+	local function addLayer(obj)
+		if #layers >= CONFIG.PreviewMaxLayers then
+			skipped = skipped + 1
+			return
+		end
+		local ok, clone = pcall(function()
+			return obj:Clone()
+		end)
+		if ok and clone then
+			layers[#layers + 1] = clone
+			layerNames[#layerNames + 1] = clone.Name
+		end
+	end
+
+	if isGuiClass(inst) then
+		addLayer(inst)
+	else
+		for _, child in ipairs(inst:GetChildren()) do
+			if isGuiClass(child) then
+				addLayer(child)
+			end
+		end
+	end
+
+	if #layers == 0 then
+		return nil, "внутри нет элементов интерфейса"
 	end
 
 	Preview.clear()
 
-	local frame
-	if clone:IsA("LayerCollector") then
-		-- ScreenGui внутрь панели не влезет: переносим его содержимое в обычный Frame
-		frame = Instance.new("Frame")
-		frame.BackgroundColor3 = P.bg
-		frame.BorderSizePixel = 0
-		frame.Size = UDim2.new(1, 0, 1, 0)
-		for _, child in ipairs(clone:GetChildren()) do
-			if isGuiClass(child) then
-				pcall(function()
-					child.Parent = frame
-				end)
+	-- внешний кадр: за него отвечает сдвиг пальцем
+	local panFrame = Instance.new("Frame")
+	panFrame.Name = "GuiPreviewPan"
+	panFrame.BackgroundTransparency = 1
+	panFrame.BorderSizePixel = 0
+	panFrame.Position = UDim2.new(0, 0, 0, 0)
+	panFrame.Size = UDim2.new(1, 0, 1, 0)
+	panFrame.ClipsDescendants = false
+	panFrame.Parent = holder
+
+	-- внутренний кадр: центрирован, за него отвечает масштаб (UIScale)
+	local wrap = Instance.new("Frame")
+	wrap.Name = "GuiPreviewWrap"
+	wrap.BackgroundTransparency = 1
+	wrap.BorderSizePixel = 0
+	wrap.AnchorPoint = Vector2.new(0.5, 0.5)
+	wrap.Position = UDim2.new(0.5, 0, 0.5, 0)
+	wrap.Size = UDim2.fromOffset(math.max(design.X, 1), math.max(design.Y, 1))
+	wrap.ClipsDescendants = false
+	wrap.Parent = panFrame
+
+	local elements, hiddenForced = 0, 0
+	for _, clone in ipairs(layers) do
+		-- в игре слой мог быть выключен — для просмотра включаем
+		pcall(function()
+			clone.Enabled = true
+		end)
+		pcall(function()
+			clone.Visible = true
+		end)
+
+		local layer = Instance.new("Frame")
+		layer.Name = clone.Name
+		layer.BackgroundTransparency = 1
+		layer.BorderSizePixel = 0
+		layer.Size = UDim2.new(1, 0, 1, 0)
+		layer.ClipsDescendants = false
+		layer.Parent = wrap
+
+		local moved = 0
+		local isContainer = clone:IsA("LayerCollector") or clone:IsA("SurfaceGui") or clone:IsA("BillboardGui")
+		if isContainer then
+			for _, child in ipairs(clone:GetChildren()) do
+				if isGuiClass(child) then
+					local ok = pcall(function()
+						child.Parent = layer
+					end)
+					if ok then
+						moved = moved + 1
+					end
+				end
+			end
+			pcall(function()
+				clone:Destroy()
+			end)
+		else
+			local wasHidden = false
+			pcall(function()
+				wasHidden = (clone.Visible == false)
+				clone.Visible = true
+			end)
+			if wasHidden then
+				hiddenForced = hiddenForced + 1
+			end
+			local ok = pcall(function()
+				clone.Parent = layer
+			end)
+			if ok then
+				moved = 1
 			end
 		end
+
+		if moved == 0 then
+			pcall(function()
+				layer:Destroy()
+			end)
+		else
+			elements = elements + moved
+		end
+	end
+
+	if elements == 0 then
 		pcall(function()
-			clone:Destroy()
+			wrap:Destroy()
 		end)
-	else
-		frame = clone
-		frame.AnchorPoint = Vector2.new(0, 0)
-		frame.Position = UDim2.new(0, 0, 0, 0)
+		return nil, "у выбранного UI нет элементов для показа"
 	end
 
-	frame.Parent = holder
-
-	-- вписываем в размеры панели
-	local size = inst.AbsoluteSize
-	local w = (size and size.X) or 0
-	local h = (size and size.Y) or 0
-	if w <= 1 or h <= 1 then
-		w, h = holder.AbsoluteSize.X, holder.AbsoluteSize.Y
-	end
+	-- вписываем в размер панели
 	local holderSize = holder.AbsoluteSize
-	local scale = 1
+	local fit = 1
 	if holderSize.X > 1 and holderSize.Y > 1 then
-		scale = math.min(holderSize.X / math.max(w, 1), holderSize.Y / math.max(h, 1), 1)
+		fit = math.min(holderSize.X / math.max(design.X, 1), holderSize.Y / math.max(design.Y, 1), 1)
 	end
+	fit = math.clamp(fit, 0.02, 4)
 	local uiScale = Instance.new("UIScale")
-	uiScale.Scale = math.clamp(scale, 0.05, 1)
-	uiScale.Parent = frame
+	uiScale.Scale = fit
+	uiScale.Parent = wrap
 
-	Preview.guiClone = frame
+	Preview.guiWrap, Preview.guiScale = wrap, uiScale
+	Preview.guiPanFrame = panFrame
+	Preview.guiClone = panFrame
+	Preview.guiFit = fit
+	Preview.guiZoom = fit
+	Preview.guiPan = Vector2.new(0, 0)
+	Preview.guiElements = elements
+	Preview.mode = "gui"
+
 	holder.Visible = true
 	if UI.previewViewport then
 		UI.previewViewport.Visible = false
 	end
-	Preview.status(string.format("UI · %s · %d×%d → масштаб %d%%", inst.ClassName, math.floor(w), math.floor(h), math.floor(scale * 100)), P.muted)
+	Preview.applyGui()
+
+	if UI.previewHint then
+		UI.previewHint.Text = "тяни пальцем — двигать, два пальца — масштаб"
+	end
+	local note = (skipped > 0) and string.format(" (показаны первые %d слоёв)", CONFIG.PreviewMaxLayers) or ""
+	if hiddenForced > 0 then
+		note = note .. string.format(" (включено скрытых: %d)", hiddenForced)
+	end
+	Preview.status(string.format("UI · %s · %d элем.%s · масштаб %d%% · тяни — двигать, 2 пальца — масштаб", inst.ClassName, elements, note, math.floor(fit * 100)), P.muted)
 	return true
 end
-
--- карточка с информацией
-local function describe(inst)
-	local lines = { inst.ClassName .. " · " .. inst.Name }
-
-	local okKids, kids = pcall(function()
-		return #inst:GetChildren()
-	end)
-	if okKids then
-		lines[#lines + 1] = "детей: " .. kids
-	end
-
-	if inst:IsA("BasePart") then
-		lines[#lines + 1] = string.format("размер: %.1f × %.1f × %.1f", inst.Size.X, inst.Size.Y, inst.Size.Z)
-		lines[#lines + 1] = string.format("позиция: %.0f, %.0f, %.0f", inst.Position.X, inst.Position.Y, inst.Position.Z)
-		if inst.Material and inst.Material ~= Enum.Material.Plastic then
-			lines[#lines + 1] = "материал: " .. tostring(inst.Material)
-		end
-	elseif inst:IsA("Model") then
-		local okSize, size = pcall(function()
-			return inst:GetExtentsSize()
-		end)
-		if okSize and typeof(size) == "Vector3" then
-			lines[#lines + 1] = string.format("габариты: %.1f × %.1f × %.1f", size.X, size.Y, size.Z)
-		end
-	elseif inst:IsA("GuiObject") then
-		lines[#lines + 1] = string.format(
-			"размер UI: %d × %d px",
-			math.floor((inst.AbsoluteSize and inst.AbsoluteSize.X) or 0),
-			math.floor((inst.AbsoluteSize and inst.AbsoluteSize.Y) or 0)
-		)
-	end
-
-	if inst:IsA("GuiObject") then
-		local okText, text = pcall(function()
-			return inst.Text
-		end)
-		if okText and type(text) == "string" and text ~= "" and #text < 300 then
-			lines[#lines + 1] = 'текст: "' .. text .. '"'
-		end
-	end
-
-	if inst:IsA("LuaSourceContainer") then
-		local okType = pcall(function()
-			return inst:GetAttribute("RunContext")
-		end)
-		local okSrc, source = pcall(function()
-			return inst.Source
-		end)
-		if okSrc and type(source) == "string" and #source > 0 then
-			lines[#lines + 1] = "код: " .. #source .. " символов (ниже — начало)"
-			local shown = {}
-			for line in string.gmatch(string.sub(source, 1, 4000), "[^\n]+") do
-				shown[#shown + 1] = line
-				if #shown >= CONFIG.PreviewSourceLines then
-					break
-				end
-			end
-			lines[#lines + 1] = table.concat(shown, "\n")
-		else
-			lines[#lines + 1] = "код недоступен из клиента (байткод). Включи «Декомпилировать скрипты» при экспорте"
-		end
-		debugLog("script attribute", okType)
-	end
-
-	local okTags, tags = pcall(function()
-		return inst:GetTags()
-	end)
-	if okTags and #tags > 0 then
-		lines[#lines + 1] = "теги: " .. table.concat(tags, ", ")
-	end
-
-	local okAttrs, attrs = pcall(function()
-		return inst:GetAttributes()
-	end)
-	if okAttrs and type(attrs) == "table" then
-		local names = {}
-		for name, value in pairs(attrs) do
-			names[#names + 1] = tostring(name) .. " = " .. tostring(value)
-			if #names >= 4 then
-				break
-			end
-		end
-		if #names > 0 then
-			lines[#lines + 1] = "атрибуты: " .. table.concat(names, ", ")
-		end
-	end
-
-	return table.concat(lines, "\n")
-end
-
 function Preview.show(inst, immediate)
 	if S.busy or not inst or typeof(inst) ~= "Instance" then
 		return
@@ -1822,12 +1921,27 @@ function Preview.show(inst, immediate)
 			UI.previewInfo.Text = describe(inst)
 		end
 
+		-- выбрал самого игрока — показываем его персонажа
+		if inst:IsA("Player") then
+			local char = inst.Character
+			if char then
+				inst = char
+				Preview.target = char
+				if UI.previewName then
+					UI.previewName.Text = char.Name
+				end
+				if UI.previewSub then
+					UI.previewSub.Text = pathToString(char, true)
+				end
+			end
+		end
+
 		local kind, err
 		if inst.Parent == game then
 			-- сервисы не клонируем целиком: это вся карта
 			Preview.clear()
 			err = "это сервис целиком — раскрой «+» и выбери объект внутри"
-		elseif isGuiClass(inst) then
+		elseif isGuiClass(inst) or inst:IsA("BasePlayerGui") then
 			kind, err = Preview.buildGui(inst)
 		else
 			kind, err = Preview.build3D(inst)
@@ -2275,36 +2389,81 @@ local function buildPicker()
 		AutoButtonColor = false,
 	}, stage)
 	local dragging, lastPos = false, nil
+	local active, pinchPrev = {}, nil
+
+	local function touchList()
+		local list = {}
+		for input, data in pairs(active) do
+			list[#list + 1] = { input = input, pos = data.pos }
+		end
+		return list
+	end
+
+	local function pinchNow()
+		local list = touchList()
+		if #list < 2 then
+			return nil
+		end
+		local a, b = list[1].pos, list[2].pos
+		return { dist = (a - b).Magnitude, mid = (a + b) * 0.5 }
+	end
+
 	drag.InputBegan:Connect(function(input)
 		if input.UserInputType == Enum.UserInputType.MouseButton1
 			or input.UserInputType == Enum.UserInputType.Touch then
 			dragging = true
 			lastPos = input.Position
+			active[input] = { pos = input.Position }
+			pinchPrev = nil
 		end
 	end)
+
 	drag.InputChanged:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseWheel then
+			Preview.zoomBy(1 - input.Position.Z * 0.08)
+			return
+		end
 		if not dragging then
 			return
 		end
 		if input.UserInputType == Enum.UserInputType.MouseMovement
 			or input.UserInputType == Enum.UserInputType.Touch then
-			if lastPos then
-				local delta = input.Position - lastPos
-				Preview.yaw = Preview.yaw - delta.X * 0.012
-				Preview.pitch = math.clamp(Preview.pitch + delta.Y * 0.012, -1.45, 1.45)
-				Preview.applyCamera()
+			if active[input] then
+				active[input].pos = input.Position
 			end
-			lastPos = input.Position
-		elseif input.UserInputType == Enum.UserInputType.MouseWheel then
-			Preview.zoom = math.clamp(Preview.zoom - input.Position.Z * 0.08, 0.25, 5)
-			Preview.applyCamera()
+
+			local two = pinchNow()
+			if two then
+				-- два пальца: масштаб + сдвиг
+				if pinchPrev and pinchPrev.dist > 1 and two.dist > 1 then
+					Preview.zoomBy(two.dist / pinchPrev.dist)
+					Preview.panBy(two.mid - pinchPrev.mid)
+				end
+				pinchPrev = two
+				lastPos = input.Position
+			elseif lastPos then
+				local delta = input.Position - lastPos
+				if Preview.mode == "gui" then
+					Preview.panBy(delta)
+				else
+					Preview.yaw = Preview.yaw - delta.X * 0.012
+					Preview.pitch = math.clamp(Preview.pitch + delta.Y * 0.012, -1.45, 1.45)
+					Preview.applyCamera()
+				end
+				lastPos = input.Position
+			end
 		end
 	end)
+
 	drag.InputEnded:Connect(function(input)
+		active[input] = nil
+		pinchPrev = nil
 		if input.UserInputType == Enum.UserInputType.MouseButton1
 			or input.UserInputType == Enum.UserInputType.Touch then
-			dragging = false
-			lastPos = nil
+			if next(active) == nil then
+				dragging = false
+				lastPos = nil
+			end
 		end
 	end)
 
@@ -2333,8 +2492,7 @@ local function buildPicker()
 		position = UDim2.new(0, 8, 1, -26),
 		textSize = 13,
 		onClick = function()
-			Preview.yaw, Preview.pitch, Preview.zoom = 0.7, 0.35, 1
-			Preview.applyCamera()
+			Preview.resetView()
 		end,
 	})
 	local autoBtn
@@ -2356,8 +2514,7 @@ local function buildPicker()
 		position = UDim2.new(0, 88, 1, -26),
 		textSize = 13,
 		onClick = function()
-			Preview.zoom = math.clamp(Preview.zoom * 1.2, 0.25, 5)
-			Preview.applyCamera()
+			Preview.zoomBy(1.2)
 		end,
 	})
 	button(previewPanel, {
@@ -2366,11 +2523,10 @@ local function buildPicker()
 		position = UDim2.new(0, 118, 1, -26),
 		textSize = 13,
 		onClick = function()
-			Preview.zoom = math.clamp(Preview.zoom / 1.2, 0.25, 5)
-			Preview.applyCamera()
+			Preview.zoomBy(1 / 1.2)
 		end,
 	})
-	label(previewPanel, {
+	UI.previewHint = label(previewPanel, {
 		Text = "крути пальцем по картинке",
 		TextSize = 9,
 		TextColor3 = P.muted,
@@ -3681,7 +3837,13 @@ runExportBody = function(roots, ignore, ignoreCount, hideGui, guiParent)
 		say(string.format("Плейс: %s (ID %d)", tostring(placeName() or "название недоступно"), game.PlaceId), P.text)
 		say(string.format("Корней: %d, объектов внутри выбранного: %d, отрезанных веток: %d", #roots, insideCount, ignoreCount or 0))
 		if #emptyPicks > 0 then
-			say("⚠ внутри пусто у: " .. table.concat(emptyPicks, ", ") .. " — возможно, не репликуется клиенту", P.warn)
+			local shown, shownCount = {}, math.min(#emptyPicks, 6)
+			for i = 1, shownCount do
+				shown[#shown + 1] = emptyPicks[i]
+			end
+			local tail = (#emptyPicks > shownCount) and (" и ещё " .. (#emptyPicks - shownCount)) or ""
+			say(string.format("ℹ у %d выбранных объектов нет содержимого (%s%s) — сохранятся пустыми, это нормально", #emptyPicks, table.concat(shown, ", "), tail), P.muted)
+			logLine("объекты без содержимого: " .. table.concat(emptyPicks, ", "))
 		end
 		if hideGui then
 			say("Окно выбора скрыто на время дампа.", P.warn)
@@ -3690,9 +3852,26 @@ runExportBody = function(roots, ignore, ignoreCount, hideGui, guiParent)
 			say("Папка экзекьютора: " .. workspaceFolder())
 		end
 	end
+	if ov then
+		say("Идёт сборка и запись файла. На больших плейсах это до минуты — окно не закрывай, полоса идёт.", P.muted)
+	end
 	task.wait(0.1)
 
 	local result = { ok = false, err = "USSI не запустился" }
+	local tickDone = false
+	task.spawn(function()
+		local t = 0.35
+		while not tickDone and S.busy do
+			task.wait(0.6)
+			if tickDone then
+				break
+			end
+			t = math.min(t + 0.012, 0.9)
+			if ov and ov.setProgress then
+				pcall(ov.setProgress, t)
+			end
+		end
+	end)
 	local okRun, runErr = pcall(function()
 		local okUSSI, ussiErr = ensureUSSI()
 		if not okUSSI then
@@ -3704,6 +3883,7 @@ runExportBody = function(roots, ignore, ignoreCount, hideGui, guiParent)
 		end
 		result = runUSSI(roots, ignore, ov)
 	end)
+	tickDone = true
 	if not okRun then
 		result.ok = false
 		result.err = tostring(runErr)
@@ -3711,7 +3891,7 @@ runExportBody = function(roots, ignore, ignoreCount, hideGui, guiParent)
 	end
 
 	if result.ok then
-		say(string.format("✓ файл записан: %s (%s)", result.path, fmtSize(result.size)), P.ok)
+		say(string.format("✅ ГОТОВО — файл записан: %s (%s)", result.path, fmtSize(result.size)), P.ok)
 		local ws = workspaceFolder()
 		if ws then
 			say("Полный путь: " .. ws .. result.path, P.muted)
@@ -3729,7 +3909,7 @@ runExportBody = function(roots, ignore, ignoreCount, hideGui, guiParent)
 		end
 		notify("Object Picker", "Сохранено: " .. tostring(result.path), 6)
 	else
-		say("✗ " .. tostring(result.err), P.bad)
+		say("❌ НЕ СОХРАНИЛОСЬ: " .. tostring(result.err), P.bad)
 		if ov then
 			ov.finish("Не получилось", P.bad)
 		end
