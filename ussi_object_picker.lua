@@ -1,7 +1,19 @@
 --[[
 ================================================================================
-  USSI OBJECT PICKER  v3.3  —  3D/UI-предпросмотр, телефон + ПК, фиксер Studio
+  USSI OBJECT PICKER  v3.3.1  —  фикс кнопки «Закрыть» после экспорта
 ================================================================================
+
+  ИСПРАВЛЕНО В v3.3.1
+  -------------------
+   * Кнопка «Закрыть» в окне экспорта больше не «мёртвая». Причина была в том,
+     что ov (таблица окна) объявлялась НИЖЕ кнопки: в Lua замыкание видело
+     глобальный nil, и клик падал с ошибкой «attempt to index nil value».
+   * Кнопка «авто» в панели превью: та же ошибка — ссылалась на себя до
+     объявления, поэтому не подсвечивалась.
+   * Экспорт обёрнут в защищённый вызов: состояние (S.busy) и окно выбора
+     восстанавливаются при ЛЮБОЙ ошибке, а не только при успешном финале.
+     Раньше после неудачного экспорта окно «залипало» — кнопки не реагировали.
+   * Если жать «X» во время сохранения — теперь пишется подсказка, а не тишина.
 
   ЧТО НОВОГО В v3.3
   -----------------
@@ -1777,10 +1789,14 @@ local function buildPicker()
 		color = P.muted,
 		hover = Color3.fromRGB(96, 42, 42),
 		onClick = function()
-			if not S.busy then
-				Preview.clear()
-				gui:Destroy()
+			if S.busy then
+				if UI.setStatus then
+					UI.setStatus("идёт сохранение — дождись окончания", P.warn)
+				end
+				return
 			end
+			Preview.clear()
+			gui:Destroy()
 		end,
 	})
 	closeBtn.hit.Name = "CloseButton"
@@ -2149,7 +2165,8 @@ local function buildPicker()
 			Preview.applyCamera()
 		end,
 	})
-	local autoBtn = button(previewPanel, {
+	local autoBtn
+	autoBtn = button(previewPanel, {
 		text = "авто",
 		size = UDim2.new(0, 46, 0, 22),
 		position = UDim2.new(0, 38, 1, -26),
@@ -2912,6 +2929,9 @@ local function createOverlay()
 		IgnoreGuiInset = true,
 	}, parent)
 
+	-- ВАЖНО: объявляем ov до кнопок, иначе замыкания кнопок видят nil
+	local ov = { gui = gui }
+
 	new("Frame", {
 		BackgroundColor3 = Color3.fromRGB(0, 0, 0),
 		BackgroundTransparency = 0.45,
@@ -2968,9 +2988,13 @@ local function createOverlay()
 		size = UDim2.new(0, 120, 0, 34),
 		position = UDim2.new(1, -134, 1, -46),
 		onClick = function()
-			if not S.busy then
-				ov.destroy()
+			if S.busy then
+				if ov.addLog then
+					ov.addLog("сохранение ещё идёт — подожди", P.warn)
+				end
+				return
 			end
+			ov.destroy()
 		end,
 	})
 
@@ -2997,6 +3021,7 @@ local function createOverlay()
 	}, logBox)
 
 	local lineCount = 0
+
 	local function refreshLog()
 		logBox.CanvasSize = UDim2.new(0, 0, 0, logLayout.AbsoluteContentSize.Y + 14)
 		local canvas = logBox.AbsoluteCanvasSize.Y
@@ -3005,8 +3030,6 @@ local function createOverlay()
 			logBox.CanvasPosition = Vector2.new(0, canvas - view)
 		end
 	end
-
-	local ov = { gui = gui }
 
 	ov.addLog = function(text, color)
 		lineCount = lineCount + 1
@@ -3401,16 +3424,38 @@ function UI.requestExport()
 	end)
 end
 
+local runExportBody
+
 function UI.runExport(roots, ignore, ignoreCount)
 	S.busy = true
 	ExportLog.lines = {}
 
 	local hideGui = picksTouchOwnGui(topPicks())
-	local guiParent = UI.gui.Parent
+	local guiParent = UI.gui and UI.gui.Parent or nil
 	if hideGui then
-		UI.gui.Parent = nil
+		pcall(function()
+			UI.gui.Parent = nil
+		end)
 	end
 
+	-- тело в защищённом вызове: что бы ни случилось, состояние сбросится ниже
+	local okBody, bodyErr = pcall(runExportBody, roots, ignore, ignoreCount, hideGui, guiParent)
+	if not okBody then
+		warn("[ObjectPicker] ошибка экспорта: " .. tostring(bodyErr))
+		notify("Object Picker", "Ошибка экспорта: " .. tostring(bodyErr):sub(1, 120), 10)
+	end
+
+	-- восстановление в любом случае: окно на место, кнопки снова живые
+	if hideGui and guiParent then
+		pcall(function()
+			UI.gui.Parent = guiParent
+		end)
+	end
+	S.busy = false
+	pcall(UI.updateStats)
+end
+
+runExportBody = function(roots, ignore, ignoreCount, hideGui, guiParent)
 	-- оверлей создаём ПЕРВЫМ делом, чтобы всегда был виден прогресс и ошибки
 	local ov
 	local okOverlay, overlayErr = pcall(function()
@@ -3505,12 +3550,12 @@ function UI.runExport(roots, ignore, ignoreCount)
 		say("Лог: " .. logPath, P.muted)
 	end
 
+	-- окно возвращаем сразу, чтобы интерфейс не ждал внешней обёртки
 	if hideGui and guiParent then
-		UI.gui.Parent = guiParent
+		pcall(function()
+			UI.gui.Parent = guiParent
+		end)
 	end
-
-	S.busy = false
-	UI.updateStats()
 end
 
 --==================================================================
