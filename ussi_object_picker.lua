@@ -1,7 +1,26 @@
 --[[
 ================================================================================
-  USSI OBJECT PICKER  v3.2  —  выбор объектов внутри сервисов + фиксер Studio
+  USSI OBJECT PICKER  v3.3  —  3D/UI-предпросмотр, телефон + ПК, фиксер Studio
 ================================================================================
+
+  ЧТО НОВОГО В v3.3
+  -----------------
+   * ТРИ РЕЖИМА РАСКЛАДКИ ПОД ЭКРАН:
+       ПК (широко)      — дерево слева, превью справа в колонке;
+       планшет/телефон  — дерево сверху, превью снизу;
+       низкий экран     — превью открывается ПОВЕРХ дерева (закрыл «✕» — вернулся).
+     Ни одна панель не вылезает за пределы окна.
+   * Горячие клавиши на ПК: Esc — закрыть подтверждение или превью,
+     R — сброс ракурса 3D-камеры. На телефоне не мешают.
+   * ПАНЕЛЬ ПРЕДПРОСМОТРА. Tap по любой строке — и справа (на ПК) или снизу
+     (на телефоне) показывается сам объект: 3D-модель во вращающемся вьюпорте
+     или живой рендер игрового UI. Плюс карточка: класс, размер, позиция,
+     материал, текст, теги, атрибуты, а у скриптов — начало кода.
+   * Управление 3D: потяни пальцем/мышью — поворот, колесо или «+»/«−» — зум,
+     «↻» — сброс ракурса, «авто» — авто-вращение.
+   * Кнопка «Превью» в тулбаре скрывает/показывает панель.
+   * Огромные объекты (> 900 частей) не клонируются — вместо них покажется
+     пояснение, чтобы не вешать клиент.
 
   ЧТО НОВОГО В v3.2
   -----------------
@@ -94,6 +113,13 @@ local CONFIG = {
 	SearchMax = 200,
 	CountBudget = 4000,
 	AutoExpandMax = 25,    -- сервисы с таким числом детей раскрываются сразу
+
+	-- превью
+	PreviewEnabled = true,   -- показывать панель предпросмотра
+	PreviewMaxParts = 900,   -- больше этого числа частей превью не строится
+	PreviewMaxGui = 250,     -- максимум элементов в превью игрового UI
+	PreviewAutoRotate = true,
+	PreviewSourceLines = 14, -- сколько строк кода показывать у скриптов
 
 	Debug = false,
 	SafeFont = false,
@@ -1221,6 +1247,484 @@ local ROW_H = 30
 local ROW_GAP = 3
 local INDENT = 15
 
+
+--==================================================================
+-- 4b. ПРЕДПРОСМОТР: 3D-модель объекта и рендер игрового UI
+--==================================================================
+local Preview = {
+	visible = CONFIG.PreviewEnabled,
+	target = nil,
+	yaw = 0.7,
+	pitch = 0.35,
+	zoom = 1,
+	autoRotate = CONFIG.PreviewAutoRotate,
+	world = nil,
+	camera = nil,
+	center = nil,
+	size = nil,
+	guiClone = nil,
+	conn = nil,
+	token = 0,
+}
+
+-- что вырезаем из клона перед показом (не влияет на внешний вид, только вес)
+local STRIP_CLASSES = {
+	Script = true, LocalScript = true, ModuleScript = true, Camera = true,
+	Terrain = true, ScreenGui = true, BillboardGui = true, SurfaceGui = true,
+	Sound = true, SoundGroup = true, ClickDetector = true, Highlight = true,
+	SelectionBox = true, SelectionSphere = true, Tool = true, Accessory = true,
+	Attachment = true, Humanoid = true,
+}
+
+local function isGuiClass(inst)
+	return inst:IsA("GuiObject") or inst:IsA("LayerCollector") or inst:IsA("UIBase")
+end
+
+local function cornersOf(cf, size)
+	local hx, hy, hz = size.X / 2, size.Y / 2, size.Z / 2
+	local out = {}
+	for _, sx in ipairs({ -hx, hx }) do
+		for _, sy in ipairs({ -hy, hy }) do
+			for _, sz in ipairs({ -hz, hz }) do
+				out[#out + 1] = cf * Vector3.new(sx, sy, sz)
+			end
+		end
+	end
+	return out
+end
+
+local function boundsOf(container)
+	local ok, cf, size = pcall(function()
+		return container:GetBoundingBox()
+	end)
+	if ok and typeof(cf) == "CFrame" and typeof(size) == "Vector3" and size.Magnitude > 0.001 then
+		return cf.Position, size
+	end
+
+	local min, max
+	for _, part in ipairs(container:GetDescendants()) do
+		if part:IsA("BasePart") then
+			for _, point in ipairs(cornersOf(part.CFrame, part.Size)) do
+				min = min or point
+				max = max or point
+				min = Vector3.new(math.min(min.X, point.X), math.min(min.Y, point.Y), math.min(min.Z, point.Z))
+				max = Vector3.new(math.max(max.X, point.X), math.max(max.Y, point.Y), math.max(max.Z, point.Z))
+			end
+		end
+	end
+	if not min or not max then
+		return Vector3.new(0, 0, 0), Vector3.new(4, 4, 4)
+	end
+	return (min + max) / 2, (max - min)
+end
+
+-- клонируем объект для показа
+local function cloneForPreview(inst)
+	local okCount, total = pcall(function()
+		return countInstances(inst, CONFIG.PreviewMaxParts * 4)
+	end)
+	if #inst:GetChildren() > 0 and total and total > CONFIG.PreviewMaxParts * 4 then
+		return nil, "объект слишком большой для превью (> " .. CONFIG.PreviewMaxParts * 4 .. " объектов)"
+	end
+
+	local ok, clone = pcall(function()
+		return inst:Clone()
+	end)
+	if not ok or not clone then
+		return nil, "не удалось скопировать объект для показа"
+	end
+
+	if STRIP_CLASSES[clone.ClassName] then
+		pcall(function()
+			clone:Destroy()
+		end)
+		return nil, "у объекта нет 3D-представления"
+	end
+
+	local parts = 0
+	for _, d in ipairs(clone:GetDescendants()) do
+		if STRIP_CLASSES[d.ClassName] then
+			pcall(function()
+				d:Destroy()
+			end)
+		elseif d:IsA("BasePart") then
+			parts = parts + 1
+		end
+	end
+	if parts == 0 and not clone:IsA("BasePart") then
+		return nil, "внутри нет 3D-геометрии"
+	end
+	if parts > CONFIG.PreviewMaxParts then
+		pcall(function()
+			clone:Destroy()
+		end)
+		return nil, "слишком много частей для превью: " .. parts
+	end
+	return clone, nil
+end
+
+function Preview.clear()
+	if Preview.world then
+		pcall(function()
+			Preview.world:Destroy()
+		end)
+	end
+	if Preview.guiClone then
+		pcall(function()
+			Preview.guiClone:Destroy()
+		end)
+	end
+	Preview.world, Preview.camera, Preview.center, Preview.size, Preview.guiClone = nil, nil, nil, nil, nil
+	if UI.previewViewport then
+		UI.previewViewport.Visible = false
+	end
+	if UI.previewGuiHolder then
+		UI.previewGuiHolder.Visible = false
+		for _, child in ipairs(UI.previewGuiHolder:GetChildren()) do
+			pcall(function()
+				child:Destroy()
+			end)
+		end
+	end
+end
+
+function Preview.applyCamera()
+	local cam, center, size = Preview.camera, Preview.center, Preview.size
+	if not cam or not center or not size then
+		return
+	end
+	local radius = math.max(size.Magnitude * 0.5, 0.4)
+	local fov = math.rad(cam.FieldOfView > 0 and cam.FieldOfView or 60)
+	local distance = (radius / math.tan(fov * 0.5)) * 1.25 * Preview.zoom
+	local dir = Vector3.new(
+		math.cos(Preview.pitch) * math.sin(Preview.yaw),
+		math.sin(Preview.pitch),
+		math.cos(Preview.pitch) * math.cos(Preview.yaw)
+	)
+	cam.CFrame = CFrame.lookAt(center + dir * distance, center)
+end
+
+function Preview.initLoop()
+	if Preview.conn or not Preview.visible then
+		return
+	end
+	local RunService = game:GetService("RunService")
+	local signal = RunService.RenderStepped or RunService.Heartbeat
+	local ok, conn = pcall(function()
+		return signal:Connect(function(dt)
+			if not Preview.visible or not Preview.camera or not Preview.center then
+				return
+			end
+			if Preview.autoRotate then
+				Preview.yaw = Preview.yaw + (dt or 0.016) * 0.35
+			end
+			pcall(Preview.applyCamera)
+		end)
+	end)
+	Preview.conn = ok and conn or nil
+end
+
+-- 3D-предпросмотр
+function Preview.build3D(inst)
+	local viewport = UI.previewViewport
+	if not viewport then
+		return nil, "окно превью не создано"
+	end
+	local clone, err = cloneForPreview(inst)
+	if not clone then
+		return nil, err
+	end
+
+	local world = Instance.new("WorldModel")
+	world.Parent = viewport
+
+	local container = clone
+	if not clone:IsA("Model") then
+		local box = Instance.new("Model")
+		clone.Parent = box
+		container = box
+	end
+	container.Parent = world
+
+	if container:IsA("Model") and not container.PrimaryPart then
+		local first = container:FindFirstChildWhichIsA("BasePart", true)
+		if first then
+			pcall(function()
+				container.PrimaryPart = first
+			end)
+		end
+	end
+
+	local cam = Instance.new("Camera")
+	cam.FieldOfView = 60
+	viewport.CurrentCamera = cam
+
+	Preview.clear()
+	Preview.world, Preview.camera = world, cam
+	Preview.center, Preview.size = boundsOf(container)
+
+	viewport.Visible = true
+	if UI.previewGuiHolder then
+		UI.previewGuiHolder.Visible = false
+	end
+	Preview.initLoop()
+	Preview.applyCamera()
+	return true
+end
+
+-- предпросмотр игрового UI
+function Preview.buildGui(inst)
+	local holder = UI.previewGuiHolder
+	if not holder then
+		return nil, "окно превью не создано"
+	end
+
+	local count = countInstances(inst, CONFIG.PreviewMaxGui)
+	if count and count > CONFIG.PreviewMaxGui then
+		return nil, "слишком много элементов UI для превью: " .. count
+	end
+
+	local ok, clone = pcall(function()
+		return inst:Clone()
+	end)
+	if not ok or not clone then
+		return nil, "не удалось скопировать UI"
+	end
+
+	Preview.clear()
+
+	local frame
+	if clone:IsA("LayerCollector") then
+		-- ScreenGui внутрь панели не влезет: переносим его содержимое в обычный Frame
+		frame = Instance.new("Frame")
+		frame.BackgroundColor3 = P.bg
+		frame.BorderSizePixel = 0
+		frame.Size = UDim2.new(1, 0, 1, 0)
+		for _, child in ipairs(clone:GetChildren()) do
+			if isGuiClass(child) then
+				pcall(function()
+					child.Parent = frame
+				end)
+			end
+		end
+		pcall(function()
+			clone:Destroy()
+		end)
+	else
+		frame = clone
+		frame.AnchorPoint = Vector2.new(0, 0)
+		frame.Position = UDim2.new(0, 0, 0, 0)
+	end
+
+	frame.Parent = holder
+
+	-- вписываем в размеры панели
+	local size = inst.AbsoluteSize
+	local w = (size and size.X) or 0
+	local h = (size and size.Y) or 0
+	if w <= 1 or h <= 1 then
+		w, h = holder.AbsoluteSize.X, holder.AbsoluteSize.Y
+	end
+	local holderSize = holder.AbsoluteSize
+	local scale = 1
+	if holderSize.X > 1 and holderSize.Y > 1 then
+		scale = math.min(holderSize.X / math.max(w, 1), holderSize.Y / math.max(h, 1), 1)
+	end
+	local uiScale = Instance.new("UIScale")
+	uiScale.Scale = math.clamp(scale, 0.05, 1)
+	uiScale.Parent = frame
+
+	Preview.guiClone = frame
+	holder.Visible = true
+	if UI.previewViewport then
+		UI.previewViewport.Visible = false
+	end
+	return true
+end
+
+-- карточка с информацией
+local function describe(inst)
+	local lines = { inst.ClassName .. " · " .. inst.Name }
+
+	local okKids, kids = pcall(function()
+		return #inst:GetChildren()
+	end)
+	if okKids then
+		lines[#lines + 1] = "детей: " .. kids
+	end
+
+	if inst:IsA("BasePart") then
+		lines[#lines + 1] = string.format("размер: %.1f × %.1f × %.1f", inst.Size.X, inst.Size.Y, inst.Size.Z)
+		lines[#lines + 1] = string.format("позиция: %.0f, %.0f, %.0f", inst.Position.X, inst.Position.Y, inst.Position.Z)
+		if inst.Material and inst.Material ~= Enum.Material.Plastic then
+			lines[#lines + 1] = "материал: " .. tostring(inst.Material)
+		end
+	elseif inst:IsA("Model") then
+		local okSize, size = pcall(function()
+			return inst:GetExtentsSize()
+		end)
+		if okSize and typeof(size) == "Vector3" then
+			lines[#lines + 1] = string.format("габариты: %.1f × %.1f × %.1f", size.X, size.Y, size.Z)
+		end
+	elseif inst:IsA("GuiObject") then
+		lines[#lines + 1] = string.format(
+			"размер UI: %d × %d px",
+			math.floor((inst.AbsoluteSize and inst.AbsoluteSize.X) or 0),
+			math.floor((inst.AbsoluteSize and inst.AbsoluteSize.Y) or 0)
+		)
+	end
+
+	if inst:IsA("GuiObject") then
+		local okText, text = pcall(function()
+			return inst.Text
+		end)
+		if okText and type(text) == "string" and text ~= "" and #text < 300 then
+			lines[#lines + 1] = 'текст: "' .. text .. '"'
+		end
+	end
+
+	if inst:IsA("LuaSourceContainer") then
+		local okType = pcall(function()
+			return inst:GetAttribute("RunContext")
+		end)
+		local okSrc, source = pcall(function()
+			return inst.Source
+		end)
+		if okSrc and type(source) == "string" and #source > 0 then
+			lines[#lines + 1] = "код: " .. #source .. " символов (ниже — начало)"
+			local shown = {}
+			for line in string.gmatch(string.sub(source, 1, 4000), "[^\n]+") do
+				shown[#shown + 1] = line
+				if #shown >= CONFIG.PreviewSourceLines then
+					break
+				end
+			end
+			lines[#lines + 1] = table.concat(shown, "\n")
+		else
+			lines[#lines + 1] = "код недоступен из клиента (байткод). Включи «Декомпилировать скрипты» при экспорте"
+		end
+		debugLog("script attribute", okType)
+	end
+
+	local okTags, tags = pcall(function()
+		return inst:GetTags()
+	end)
+	if okTags and #tags > 0 then
+		lines[#lines + 1] = "теги: " .. table.concat(tags, ", ")
+	end
+
+	local okAttrs, attrs = pcall(function()
+		return inst:GetAttributes()
+	end)
+	if okAttrs and type(attrs) == "table" then
+		local names = {}
+		for name, value in pairs(attrs) do
+			names[#names + 1] = tostring(name) .. " = " .. tostring(value)
+			if #names >= 4 then
+				break
+			end
+		end
+		if #names > 0 then
+			lines[#lines + 1] = "атрибуты: " .. table.concat(names, ", ")
+		end
+	end
+
+	return table.concat(lines, "\n")
+end
+
+function Preview.show(inst, immediate)
+	if not Preview.visible or S.busy or not inst or typeof(inst) ~= "Instance" then
+		return
+	end
+	Preview.token = Preview.token + 1
+	local token = Preview.token
+
+	local function refresh()
+		if Preview.token ~= token or not Preview.visible or S.busy then
+			return
+		end
+		Preview.target = inst
+
+		local fullPath = pathToString(inst, true)
+		if UI.previewName then
+			UI.previewName.Text = inst.Name
+		end
+		if UI.previewSub then
+			UI.previewSub.Text = fullPath
+		end
+
+		-- исчез из мира (например, удалён игрой)
+		local alive = pcall(function()
+			return inst.Parent ~= nil
+		end)
+		if not alive or (inst.Parent == nil and not inst:IsDescendantOf(game)) then
+			Preview.clear()
+			if UI.previewInfo then
+				UI.previewInfo.Text = "объект больше не существует в игре"
+			end
+			return
+		end
+
+		if UI.previewInfo then
+			UI.previewInfo.Text = describe(inst)
+		end
+
+		local kind, err
+		if inst.Parent == game then
+			-- сервисы не клонируем целиком: это вся карта
+			Preview.clear()
+			err = "это сервис целиком — раскрой «+» и выбери объект внутри"
+		elseif isGuiClass(inst) then
+			kind, err = Preview.buildGui(inst)
+		else
+			kind, err = Preview.build3D(inst)
+		end
+
+		if not kind and err and UI.previewInfo then
+			UI.previewInfo.Text = (UI.previewInfo.Text or "") .. "\n\n" .. err
+		end
+	end
+
+	if immediate then
+		refresh()
+	else
+		task.delay(0.12, refresh)
+	end
+end
+
+-- подгонка внутренних элементов панели под её реальную высоту
+function Preview.layoutPanel()
+	local panel = UI.previewPanel
+	local stage = UI.previewStage
+	if not panel or not stage then
+		return
+	end
+	local h = panel.AbsoluteSize.Y
+	if h <= 1 then
+		return
+	end
+	local showInfo = (h >= 170) and not S.previewOverlay
+	if UI.previewInfo then
+		UI.previewInfo.Visible = showInfo
+	end
+	local reserve = showInfo and 78 or 26
+	stage.Size = UDim2.new(1, -16, 1, -40 - reserve)
+end
+
+function Preview.setVisible(value)
+	Preview.visible = value and true or false
+	if not Preview.visible then
+		Preview.clear()
+	end
+	if UI.previewPanel then
+		UI.previewPanel.Visible = Preview.visible
+	end
+	pcall(UI.layout)
+	task.defer(function()
+		pcall(Preview.layoutPanel)
+	end)
+end
+
 local function buildPicker()
 	local parent = getGuiParent()
 	if not parent then
@@ -1274,6 +1778,7 @@ local function buildPicker()
 		hover = Color3.fromRGB(96, 42, 42),
 		onClick = function()
 			if not S.busy then
+				Preview.clear()
 				gui:Destroy()
 			end
 		end,
@@ -1319,6 +1824,12 @@ local function buildPicker()
 		text = "Проверка",
 		onClick = function()
 			UI.diagnostics()
+		end,
+	})
+	local previewBtn = button(win, {
+		text = "Превью",
+		onClick = function()
+			Preview.setVisible(not Preview.visible)
 		end,
 	})
 
@@ -1425,6 +1936,7 @@ local function buildPicker()
 		Visible = false,
 		ZIndex = 20,
 	}, win)
+	UI.modalHolder = modalHolder
 
 	new("TextButton", {
 		BackgroundColor3 = Color3.fromRGB(0, 0, 0),
@@ -1508,6 +2020,176 @@ local function buildPicker()
 		UI.onConfirm = nil
 	end
 
+	-- ---------- панель предпросмотра ----------
+	local previewPanel = new("Frame", {
+		BackgroundColor3 = P.panel,
+		BorderSizePixel = 0,
+		Visible = false,
+		ZIndex = 3,
+	}, win)
+	corner(previewPanel, 8)
+	UI.previewPanel = previewPanel
+
+	UI.previewName = label(previewPanel, {
+		Text = "Предпросмотр",
+		Font = FONT_BOLD,
+		TextSize = 12,
+		Position = UDim2.new(0, 8, 0, 6),
+		Size = UDim2.new(1, -40, 0, 16),
+		TextTruncate = Enum.TextTruncate.AtEnd,
+	})
+	UI.previewSub = label(previewPanel, {
+		Text = "тапни объект — покажу, как он выглядит",
+		TextSize = 10,
+		TextColor3 = P.muted,
+		Position = UDim2.new(0, 8, 0, 22),
+		Size = UDim2.new(1, -16, 0, 14),
+		TextTruncate = Enum.TextTruncate.AtEnd,
+	})
+
+	local closePrev = button(previewPanel, {
+		text = "✕",
+		size = UDim2.new(0, 30, 0, 26),
+		position = UDim2.new(1, -36, 0, 4),
+		textSize = 13,
+		color = P.muted,
+		hover = Color3.fromRGB(96, 42, 42),
+		onClick = function()
+			Preview.setVisible(false)
+		end,
+	})
+	closePrev.hit.Name = "ClosePreview"
+
+	local stage = new("Frame", {
+		BackgroundColor3 = P.bg,
+		BorderSizePixel = 0,
+		Position = UDim2.new(0, 8, 0, 40),
+		Size = UDim2.new(1, -16, 1, -40 - 78),
+		ClipsDescendants = true,
+	}, previewPanel)
+	corner(stage, 6)
+	UI.previewStage = stage
+
+	UI.previewViewport = new("ViewportFrame", {
+		BackgroundColor3 = P.bg,
+		BorderSizePixel = 0,
+		Size = UDim2.new(1, 0, 1, 0),
+		Visible = false,
+		LightColor = Color3.fromRGB(255, 250, 240),
+		LightDirection = Vector3.new(-0.5, -1, -0.6),
+		Ambient = Color3.fromRGB(120, 120, 130),
+	}, stage)
+
+	UI.previewGuiHolder = new("Frame", {
+		BackgroundColor3 = P.bg,
+		BorderSizePixel = 0,
+		Size = UDim2.new(1, 0, 1, 0),
+		ClipsDescendants = true,
+		Visible = false,
+	}, stage)
+
+	local drag = new("TextButton", {
+		BackgroundTransparency = 1,
+		BorderSizePixel = 0,
+		Size = UDim2.new(1, 0, 1, 0),
+		Text = "",
+		AutoButtonColor = false,
+	}, stage)
+	local dragging, lastPos = false, nil
+	drag.InputBegan:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1
+			or input.UserInputType == Enum.UserInputType.Touch then
+			dragging = true
+			lastPos = input.Position
+		end
+	end)
+	drag.InputChanged:Connect(function(input)
+		if not dragging then
+			return
+		end
+		if input.UserInputType == Enum.UserInputType.MouseMovement
+			or input.UserInputType == Enum.UserInputType.Touch then
+			if lastPos then
+				local delta = input.Position - lastPos
+				Preview.yaw = Preview.yaw - delta.X * 0.012
+				Preview.pitch = math.clamp(Preview.pitch + delta.Y * 0.012, -1.45, 1.45)
+				Preview.applyCamera()
+			end
+			lastPos = input.Position
+		elseif input.UserInputType == Enum.UserInputType.MouseWheel then
+			Preview.zoom = math.clamp(Preview.zoom - input.Position.Z * 0.08, 0.25, 5)
+			Preview.applyCamera()
+		end
+	end)
+	drag.InputEnded:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1
+			or input.UserInputType == Enum.UserInputType.Touch then
+			dragging = false
+			lastPos = nil
+		end
+	end)
+
+	UI.previewInfo = label(previewPanel, {
+		Text = "",
+		TextSize = 10,
+		TextColor3 = P.muted,
+		TextWrapped = true,
+		TextYAlignment = Enum.TextYAlignment.Top,
+		Position = UDim2.new(0, 8, 1, -80),
+		Size = UDim2.new(1, -16, 0, 52),
+	})
+
+	button(previewPanel, {
+		text = "↻",
+		size = UDim2.new(0, 26, 0, 22),
+		position = UDim2.new(0, 8, 1, -26),
+		textSize = 13,
+		onClick = function()
+			Preview.yaw, Preview.pitch, Preview.zoom = 0.7, 0.35, 1
+			Preview.applyCamera()
+		end,
+	})
+	local autoBtn = button(previewPanel, {
+		text = "авто",
+		size = UDim2.new(0, 46, 0, 22),
+		position = UDim2.new(0, 38, 1, -26),
+		textSize = 11,
+		color = Preview.autoRotate and P.accent or P.muted,
+		onClick = function()
+			Preview.autoRotate = not Preview.autoRotate
+			autoBtn.label.TextColor3 = Preview.autoRotate and P.accent or P.muted
+			Preview.initLoop()
+		end,
+	})
+	button(previewPanel, {
+		text = "−",
+		size = UDim2.new(0, 26, 0, 22),
+		position = UDim2.new(0, 88, 1, -26),
+		textSize = 13,
+		onClick = function()
+			Preview.zoom = math.clamp(Preview.zoom * 1.2, 0.25, 5)
+			Preview.applyCamera()
+		end,
+	})
+	button(previewPanel, {
+		text = "+",
+		size = UDim2.new(0, 26, 0, 22),
+		position = UDim2.new(0, 118, 1, -26),
+		textSize = 13,
+		onClick = function()
+			Preview.zoom = math.clamp(Preview.zoom / 1.2, 0.25, 5)
+			Preview.applyCamera()
+		end,
+	})
+	label(previewPanel, {
+		Text = "крути пальцем по картинке",
+		TextSize = 9,
+		TextColor3 = P.muted,
+		Position = UDim2.new(0, 150, 1, -26),
+		Size = UDim2.new(1, -158, 0, 22),
+		TextTruncate = Enum.TextTruncate.AtEnd,
+	})
+
 	-- ---------- раскладка ----------
 	local touch = false
 	pcall(function()
@@ -1517,18 +2199,18 @@ local function buildPicker()
 
 	function UI.layout()
 		local vp = viewportSize()
-		local W = math.clamp(vp.X - 20, 300, 680)
-		local H = math.clamp(vp.Y - 20, 300, 820)
-		local compact = (W < 560) or (H < 520) or touch
+		local W = math.clamp(vp.X - 20, 300, 760)
+		local H = math.clamp(vp.Y - 20, 300, 860)
+		local compact = (W < 560) or (H < 540) or touch
 		S.compact = compact
 
 		local pad = compact and 8 or 12
 		local headH = compact and 30 or 40
 		local toolH = touch and 36 or 30
-		local smallBtnH = toolH
 		local exportH = touch and 44 or 40
 		local statusH = 14
 		local gap = 6
+		local previewVisible = Preview.visible and UI.previewPanel ~= nil
 
 		ROW_H = touch and 32 or 28
 
@@ -1558,15 +2240,19 @@ local function buildPicker()
 		search.TextSize = touch and 13 or 12
 		y = y + toolH + gap
 
-		-- кнопки инструментов: 4 равные
-		local btnW = math.floor((W - pad * 2 - gap * 3) / 4)
-		local buttons = { resetBtn, collapseBtn, settingsBtn, diagBtn }
+		-- кнопки инструментов (5 штук)
+		local shortLabels = { "Сброс", "Сверн.", "Настр.", "Пров.", "Вид" }
+		local longLabels = { "Сброс", "Свернуть", "Настройки", "Проверка", "Превью" }
+		local buttons = { resetBtn, collapseBtn, settingsBtn, diagBtn, previewBtn }
+		local btnW = math.floor((W - pad * 2 - gap * (#buttons - 1)) / #buttons)
 		for i, btn in ipairs(buttons) do
 			btn.frame.Position = UDim2.new(0, pad + (i - 1) * (btnW + gap), 0, y)
-			btn.frame.Size = UDim2.new(0, btnW, 0, smallBtnH)
-			btn.label.TextSize = touch and 12 or 11
+			btn.frame.Size = UDim2.new(0, btnW, 0, toolH)
+			btn.label.Text = compact and shortLabels[i] or longLabels[i]
+			btn.label.TextSize = compact and 10 or 11
 		end
-		y = y + smallBtnH + gap
+		previewBtn.label.TextColor3 = previewVisible and P.accent or P.text
+		y = y + toolH + gap
 
 		-- низ: статус + экспорт
 		local exportY = H - pad - exportH
@@ -1577,16 +2263,18 @@ local function buildPicker()
 		exportBtn.frame.Size = UDim2.new(1, -pad * 2, 0, exportH)
 		exportBtn.label.TextSize = touch and 15 or 14
 
-		-- панель настроек
-		local panelW = W - pad * 2
+		-- панель настроек (считаем раньше превью, чтобы знать, где заканчивается место)
+		local bottomLimit = statusY - gap
 		if S.settingsOpen then
 			local rowH = touch and 32 or 26
+			local panelW = W - pad * 2
 			local cols = (panelW >= 460) and 2 or 1
 			local rows = math.ceil(#UI.toggles / cols)
-			local contentH = pad + 26 + gap + #UI.toggles * (rowH + 4) / cols + 4 + (compact and 0 or 54)
-			local maxPanelH = math.max(90, (H - pad * 2 - headH - toolH * 2 - exportH - statusH - 120))
+			local contentH = 6 + 26 + gap + rows * (rowH + 4) + 4 + (compact and 0 or 52)
+			local reserve = previewVisible and 140 or 80
+			local maxPanelH = math.max(80, bottomLimit - y - reserve)
 			local panelH = math.min(contentH + 12, maxPanelH)
-			panel.Position = UDim2.new(0, pad, 0, statusY - gap - panelH)
+			panel.Position = UDim2.new(0, pad, 0, bottomLimit - panelH)
 			panel.Size = UDim2.new(0, panelW, 0, panelH)
 			panel.CanvasSize = UDim2.new(0, 0, 0, contentH + 12)
 			panel.Visible = true
@@ -1611,19 +2299,50 @@ local function buildPicker()
 				UI.helpLbl.Visible = true
 				local helpY = py + rows * (rowH + 4) + 4
 				UI.helpLbl.Position = UDim2.new(0, px, 0, helpY)
-				UI.helpLbl.Size = UDim2.new(0, panelW - px * 2, 0, 50)
+				UI.helpLbl.Size = UDim2.new(0, panelW - px * 2, 0, 46)
 			else
 				UI.helpLbl.Visible = false
 			end
+
+			bottomLimit = bottomLimit - panelH - gap
 		else
 			panel.Visible = false
 		end
 
-		-- список: всё, что осталось между тулбаром и панелью
-		local listBottom = (S.settingsOpen and panel.Visible) and (panel.Position.Y.Offset - 6) or statusY
-		local listH = math.max(90, listBottom - y - 6)
+		-- превью + список: на ПК колонка справа, на телефоне — снизу или поверх дерева
+		local areaH = math.max(60, bottomLimit - y)
 		list.Position = UDim2.new(0, pad, 0, y)
-		list.Size = UDim2.new(1, -pad * 2, 0, listH)
+		list.Size = UDim2.new(1, -pad * 2, 0, areaH)
+		S.previewOverlay = false
+
+		if previewVisible then
+			UI.previewPanel.Visible = true
+			local wide = (not compact) and W >= 620
+			if wide then
+				-- ПК: две колонки, дерево слева, превью справа
+				local pw = math.clamp(math.floor((W - pad * 2) * 0.40), 200, 320)
+				UI.previewPanel.Position = UDim2.new(1, -pad - pw, 0, y)
+				UI.previewPanel.Size = UDim2.new(0, pw, 0, areaH)
+				UI.previewPanel.ZIndex = 3
+				list.Size = UDim2.new(1, -pad * 2 - pw - gap, 0, areaH)
+			elseif areaH >= 210 then
+				-- планшет / широкий телефон: превью снизу, дерево сверху
+				local ph = math.clamp(math.floor(areaH * 0.55), 110, 260)
+				local listH = math.max(70, areaH - ph - gap)
+				UI.previewPanel.Position = UDim2.new(0, pad, 0, y + listH + gap)
+				UI.previewPanel.Size = UDim2.new(1, -pad * 2, 0, math.min(ph, areaH - listH - gap))
+				UI.previewPanel.ZIndex = 3
+				list.Size = UDim2.new(1, -pad * 2, 0, listH)
+			else
+				-- низкий экран (телефон в ландшафте): превью поверх дерева, дерево не сжимаем
+				UI.previewPanel.Position = UDim2.new(0, pad, 0, y)
+				UI.previewPanel.Size = UDim2.new(1, -pad * 2, 0, areaH)
+				UI.previewPanel.ZIndex = 8
+				S.previewOverlay = true
+			end
+		else
+			UI.previewPanel.Visible = false
+		end
 
 		-- модалка
 		local modalW = math.min(vp.X - 40, 440)
@@ -1646,8 +2365,10 @@ local function buildPicker()
 			cancelBtn.frame.Position = UDim2.new(1, -290, 1, -12 - btnH)
 		end
 
-		-- список подстроить под текущую высоту строк
 		UI.render()
+		task.defer(function()
+			pcall(Preview.layoutPanel)
+		end)
 	end
 
 	-- поворот телефона / смена размера окна
@@ -1792,6 +2513,7 @@ local function makeTreeRow(node)
 
 	onTap(hit, function()
 		toggleAt(node)
+		Preview.show(node.inst)
 	end)
 
 	node.row = refs
@@ -2014,6 +2736,7 @@ local function showResults(matches)
 			toggleAt(node)
 			mark.Visible = effectiveFlag(node)
 			box.BackgroundColor3 = effectiveFlag(node) and P.accent or P.panel2
+			Preview.show(node.inst)
 		end)
 
 		local selected = effectiveFlag(node)
@@ -2873,6 +3596,32 @@ local function main()
 			end)
 		end)
 	end
+
+	-- горячие клавиши ПК: Esc — закрыть модалку/превью, R — сброс ракурса
+	pcall(function()
+		local uis = game:GetService("UserInputService")
+		uis.InputBegan:Connect(function(input, processed)
+			if processed then
+				return
+			end
+			if uis:GetFocusedTextBox() then
+				return
+			end
+			local key = input.KeyCode
+			if key == Enum.KeyCode.Escape then
+				if UI.modalHolder and UI.modalHolder.Visible then
+					UI.hideModal()
+				elseif Preview.visible then
+					Preview.setVisible(false)
+				end
+			elseif key == Enum.KeyCode.R then
+				if Preview.visible then
+					Preview.yaw, Preview.pitch, Preview.zoom = 0.7, 0.35, 1
+					Preview.applyCamera()
+				end
+			end
+		end)
+	end)
 
 	-- дерево строим сразу, USSI грузим в фоне
 	task.spawn(function()
