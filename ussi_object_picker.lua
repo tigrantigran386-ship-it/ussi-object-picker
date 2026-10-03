@@ -1,7 +1,30 @@
 --[[
 ================================================================================
-  USSI OBJECT PICKER  v3.3.1  —  фикс кнопки «Закрыть» после экспорта
+  USSI OBJECT PICKER  v3.4  —  починен рендер превью + тест 3D
 ================================================================================
+
+  ИСПРАВЛЕНО В v3.4
+  ------------------
+   * ПРЕВЬЮ ВООБЩЕ НЕ ОТРИСОВЫВАЛОСЬ. Причина: камера для ViewportFrame
+     создавалась без родителя (Instance.new("Camera") и всё). В Studio это
+     иногда работает, а в живом клиенте вьюпорт часто остаётся пустым.
+     Теперь камера лежит ВНУТРИ ViewportFrame (cam.Parent = viewport) и имеет
+     CameraType = Scriptable — это надёжный, рабочий вариант.
+   * Порядок вызовов: раньше Preview.clear() вызывался ПОСЛЕ подстановки
+     новой камеры и мог гасить вьюпорт. Теперь сначала очистка, потом сборка,
+     и видимость выставляется в конце явно.
+   * Свет вьюпорта ярче (Ambient 170 против 120) + белый LightColor:
+     раньше модели с плотными материалами выглядели почти чёрными.
+   * Если WorldModel не приживается (капризный экзекьютор) — объект кладётся
+     во вьюпорт напрямую, есть фолбэк.
+   * ТЕСТ 3D при запуске: в панели сразу показываются три цветных кубика.
+     Видишь кубики — значит ViewportFrame работает, и любой выбранный объект
+     тоже отрисуется. Не видишь — рендер вьюпорта недоступен в экзекьюторе.
+   * СТАТУС-СТРОКА под сценой теперь всегда видна: пишет «3D · Model · частей 42»
+     или конкретную причину («слишком много частей», «не удалось скопировать»).
+     Раньше ошибки было видно только на высокой панели.
+   * Кнопка «Проверка» показывает состояние вьюпорта: объектов внутри, есть ли
+     камера, включена ли видимость.
 
   ИСПРАВЛЕНО В v3.3.1
   -------------------
@@ -1375,7 +1398,25 @@ local function cloneForPreview(inst)
 	return clone, nil
 end
 
+function Preview.status(text, color)
+	if UI.previewStatus then
+		UI.previewStatus.Text = text or ""
+		UI.previewStatus.TextColor3 = color or P.muted
+	end
+end
+
 function Preview.clear()
+	local viewport = UI.previewViewport
+	if viewport then
+		pcall(function()
+			viewport.CurrentCamera = nil
+		end)
+	end
+	if Preview.camera then
+		pcall(function()
+			Preview.camera:Destroy()
+		end)
+	end
 	if Preview.world then
 		pcall(function()
 			Preview.world:Destroy()
@@ -1387,9 +1428,6 @@ function Preview.clear()
 		end)
 	end
 	Preview.world, Preview.camera, Preview.center, Preview.size, Preview.guiClone = nil, nil, nil, nil, nil
-	if UI.previewViewport then
-		UI.previewViewport.Visible = false
-	end
 	if UI.previewGuiHolder then
 		UI.previewGuiHolder.Visible = false
 		for _, child in ipairs(UI.previewGuiHolder:GetChildren()) do
@@ -1398,6 +1436,65 @@ function Preview.clear()
 			end)
 		end
 	end
+end
+
+-- тестовая сценка: сразу видно, работает ли ViewportFrame в твоём экзекьюторе
+function Preview.buildIdle()
+	local viewport = UI.previewViewport
+	if not viewport or not Preview.visible then
+		return
+	end
+
+	Preview.clear()
+
+	local colors = {
+		Color3.fromRGB(255, 92, 92),
+		Color3.fromRGB(64, 214, 128),
+		Color3.fromRGB(92, 140, 255),
+	}
+	local holder = Instance.new("WorldModel")
+	for i = 1, 3 do
+		local part = Instance.new("Part")
+		part.Anchored = true
+		part.Size = Vector3.new(1.4, 1.4, 1.4)
+		part.Position = Vector3.new((i - 2) * 2.1, 0, 0)
+		part.Color = colors[i]
+		part.Material = Enum.Material.SmoothPlastic
+		part.Parent = holder
+	end
+	local okWorld = pcall(function()
+		holder.Parent = viewport
+	end)
+	if not okWorld then
+		for _, part in ipairs(holder:GetChildren()) do
+			pcall(function()
+				part.Parent = viewport
+			end)
+		end
+		pcall(function()
+			holder:Destroy()
+		end)
+		holder = viewport
+	end
+
+	local cam = Instance.new("Camera")
+	cam.CameraType = Enum.CameraType.Scriptable
+	cam.FieldOfView = 60
+	pcall(function()
+		cam.Parent = viewport
+	end)
+	viewport.CurrentCamera = cam
+	viewport.Visible = true
+
+	Preview.world, Preview.camera = holder, cam
+	Preview.center, Preview.size = Vector3.new(0, 0, 0), Vector3.new(7, 2, 2)
+
+	Preview.initLoop()
+	Preview.applyCamera()
+	pcall(function()
+		viewport.CurrentCamera = cam
+	end)
+	Preview.status("тест 3D: кубики видны? тапни объект в списке", P.ok)
 end
 
 function Preview.applyCamera()
@@ -1447,8 +1544,8 @@ function Preview.build3D(inst)
 		return nil, err
 	end
 
-	local world = Instance.new("WorldModel")
-	world.Parent = viewport
+	-- сначала убираем прошлое содержимое, только потом строим новое
+	Preview.clear()
 
 	local container = clone
 	if not clone:IsA("Model") then
@@ -1456,31 +1553,60 @@ function Preview.build3D(inst)
 		clone.Parent = box
 		container = box
 	end
-	container.Parent = world
 
-	if container:IsA("Model") and not container.PrimaryPart then
-		local first = container:FindFirstChildWhichIsA("BasePart", true)
-		if first then
-			pcall(function()
-				container.PrimaryPart = first
-			end)
-		end
+	local center, size = boundsOf(container)
+	if size.Magnitude < 0.01 then
+		pcall(function()
+			container:Destroy()
+		end)
+		return nil, "не смог определить размеры объекта"
+	end
+
+	-- WorldModel держит объект; если движок капризничает — кладём напрямую во вьюпорт
+	local holder = Instance.new("WorldModel")
+	container.Parent = holder
+	local okWorld = pcall(function()
+		holder.Parent = viewport
+	end)
+	if not okWorld then
+		pcall(function()
+			container.Parent = viewport
+		end)
+		pcall(function()
+			holder:Destroy()
+		end)
+		holder = container
 	end
 
 	local cam = Instance.new("Camera")
+	cam.CameraType = Enum.CameraType.Scriptable
 	cam.FieldOfView = 60
+	pcall(function()
+		cam.Parent = viewport      -- КЛЮЧЕВОЕ: камера должна лежать внутри ViewportFrame
+	end)
 	viewport.CurrentCamera = cam
-
-	Preview.clear()
-	Preview.world, Preview.camera = world, cam
-	Preview.center, Preview.size = boundsOf(container)
-
 	viewport.Visible = true
+
+	Preview.world, Preview.camera = holder, cam
+	Preview.center, Preview.size = center, size
+
 	if UI.previewGuiHolder then
 		UI.previewGuiHolder.Visible = false
 	end
+
 	Preview.initLoop()
 	Preview.applyCamera()
+	pcall(function()
+		viewport.CurrentCamera = cam
+	end)
+
+	local parts = 0
+	for _, d in ipairs(container:GetDescendants()) do
+		if d:IsA("BasePart") then
+			parts = parts + 1
+		end
+	end
+	Preview.status(string.format("3D · %s · частей %d · %.1f×%.1f×%.1f", inst.ClassName, parts, size.X, size.Y, size.Z), P.muted)
 	return true
 end
 
@@ -1551,6 +1677,7 @@ function Preview.buildGui(inst)
 	if UI.previewViewport then
 		UI.previewViewport.Visible = false
 	end
+	Preview.status(string.format("UI · %s · %d×%d → масштаб %d%%", inst.ClassName, math.floor(w), math.floor(h), math.floor(scale * 100)), P.muted)
 	return true
 end
 
@@ -1645,7 +1772,21 @@ local function describe(inst)
 end
 
 function Preview.show(inst, immediate)
-	if not Preview.visible or S.busy or not inst or typeof(inst) ~= "Instance" then
+	if S.busy or not inst or typeof(inst) ~= "Instance" then
+		return
+	end
+	Preview.target = inst
+
+	-- мгновенный отклик в шапке панели
+	if UI.previewName then
+		UI.previewName.Text = inst.Name
+	end
+	if UI.previewSub then
+		UI.previewSub.Text = pathToString(inst, true)
+	end
+	Preview.status("готовлю превью…", P.muted)
+
+	if not Preview.visible then
 		return
 	end
 	Preview.token = Preview.token + 1
@@ -1692,8 +1833,8 @@ function Preview.show(inst, immediate)
 			kind, err = Preview.build3D(inst)
 		end
 
-		if not kind and err and UI.previewInfo then
-			UI.previewInfo.Text = (UI.previewInfo.Text or "") .. "\n\n" .. err
+		if not kind and err then
+			Preview.status("⚠ " .. err, P.warn)
 		end
 	end
 
@@ -1715,21 +1856,42 @@ function Preview.layoutPanel()
 	if h <= 1 then
 		return
 	end
-	local showInfo = (h >= 170) and not S.previewOverlay
+	local showInfo = (h >= 210) and not S.previewOverlay
 	if UI.previewInfo then
 		UI.previewInfo.Visible = showInfo
 	end
-	local reserve = showInfo and 78 or 26
+	if UI.previewStatus then
+		UI.previewStatus.Visible = true
+	end
+	local reserve = showInfo and 134 or 54
 	stage.Size = UDim2.new(1, -16, 1, -40 - reserve)
+	if stage.AbsoluteSize.Y < 8 and UI.previewStatus then
+		UI.previewStatus.Text = "мало места для превью — увеличь окно"
+	end
 end
 
 function Preview.setVisible(value)
 	Preview.visible = value and true or false
-	if not Preview.visible then
-		Preview.clear()
-	end
 	if UI.previewPanel then
 		UI.previewPanel.Visible = Preview.visible
+	end
+	if not Preview.visible then
+		Preview.clear()
+		Preview.status("превью выключено", P.muted)
+	else
+		pcall(UI.layout)
+		task.defer(function()
+			pcall(Preview.layoutPanel)
+			local target = Preview.target
+			local alive = target and pcall(function()
+				return target.Parent ~= nil
+			end)
+			if alive then
+				Preview.show(target, true)
+			else
+				Preview.buildIdle()
+			end
+		end)
 	end
 	pcall(UI.layout)
 	task.defer(function()
@@ -2087,13 +2249,14 @@ local function buildPicker()
 	UI.previewStage = stage
 
 	UI.previewViewport = new("ViewportFrame", {
-		BackgroundColor3 = P.bg,
+		BackgroundColor3 = Color3.fromRGB(24, 26, 33),
 		BorderSizePixel = 0,
 		Size = UDim2.new(1, 0, 1, 0),
 		Visible = false,
-		LightColor = Color3.fromRGB(255, 250, 240),
-		LightDirection = Vector3.new(-0.5, -1, -0.6),
-		Ambient = Color3.fromRGB(120, 120, 130),
+		ImageTransparency = 0,
+		LightColor = Color3.fromRGB(255, 255, 255),
+		LightDirection = Vector3.new(-0.4, -1, -0.4),
+		Ambient = Color3.fromRGB(170, 170, 180),
 	}, stage)
 
 	UI.previewGuiHolder = new("Frame", {
@@ -2145,14 +2308,23 @@ local function buildPicker()
 		end
 	end)
 
+	UI.previewStatus = label(previewPanel, {
+		Text = "готовлю превью…",
+		TextSize = 10,
+		TextColor3 = P.muted,
+		TextTruncate = Enum.TextTruncate.AtEnd,
+		Position = UDim2.new(0, 8, 1, -48),
+		Size = UDim2.new(1, -16, 0, 14),
+	})
+
 	UI.previewInfo = label(previewPanel, {
 		Text = "",
 		TextSize = 10,
 		TextColor3 = P.muted,
 		TextWrapped = true,
 		TextYAlignment = Enum.TextYAlignment.Top,
-		Position = UDim2.new(0, 8, 1, -80),
-		Size = UDim2.new(1, -16, 0, 52),
+		Position = UDim2.new(0, 8, 1, -128),
+		Size = UDim2.new(1, -16, 0, 74),
 	})
 
 	button(previewPanel, {
@@ -2891,6 +3063,8 @@ local function preflightData()
 	add("gethiddenproperty", ghp, ghp and "" or "часть свойств не прочитается (не критично)")
 	local ws = workspaceFolder()
 	add("getworkspace", ws ~= nil, ws and ("папка: " .. ws) or "путь файла покажу иначе")
+	add("ViewportFrame (3D-превью)", UI.previewViewport ~= nil, UI.previewViewport and "панель создана" or "панели нет")
+	add("Превью включено", Preview.visible == true, Preview.visible and "да" or "нет (кнопка «Превью»)")
 	return items
 end
 
@@ -2906,6 +3080,23 @@ function UI.diagnostics()
 		local last = ok and "✓ USSI загружается" or "✗ USSI не загрузился — смотри консоль (F9)"
 		lines[#lines + 1] = last
 		lines[#lines + 1] = ""
+		local vp = UI.previewViewport
+		if vp then
+			local kids = #vp:GetChildren()
+			local cam = vp.CurrentCamera
+			lines[#lines + 1] = string.format(
+				"Превью: объектов во вьюпорте %d, камера %s, видимость %s",
+				kids,
+				cam and "есть" or "нет",
+				vp.Visible and "вкл" or "выкл"
+			)
+			if kids == 0 then
+				lines[#lines + 1] = "Во вьюпорте пусто — тапни объект в списке, тогда появится содержимое."
+			end
+			if not cam and kids > 0 then
+				lines[#lines + 1] = "Камера не установлена — превью не отрисуется, сообщи об этом."
+			end
+		end
 		lines[#lines + 1] = "Формат вывода: " .. (CAP.buffer and ".rbxl/.rbxm (бинарный)" or ".rbxlx/.rbxmx (XML)")
 		UI.confirm("Проверка окружения", table.concat(lines, "\n"), nil, "Понятно")
 		UI.updateStats()
@@ -3613,6 +3804,13 @@ local function main()
 	buildPicker()
 	UI.layout()
 	UI.updateStats()
+
+	-- сразу показываем тестовую сценку: видно, работает ли ViewportFrame в экзекьюторе
+	task.delay(0.7, function()
+		if Preview.visible and not Preview.target then
+			pcall(Preview.buildIdle)
+		end
+	end)
 
 	-- поиск
 	local searchBox
